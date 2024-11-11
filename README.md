@@ -1,5 +1,5 @@
 ## Distributed mutex
-#Running the System
+Running the System
 Starting Nodes
 To run the system, each node in the distributed system must be started separately on different machines or the same machine with different ports. You can specify the node ID, the address of the next node in the token ring, and whether the node starts with the token.
 
