@@ -16,6 +16,7 @@ message AccessRequest {
 
 message AccessGrant {
   int32 nodeId = 1;
+  int64 timestamp = 2;
 }
 
 message AccessReply {}
