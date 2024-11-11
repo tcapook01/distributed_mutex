@@ -1,0 +1,20 @@
+// tokenring.proto
+syntax = "proto3";
+package proto;
+option go_package = "distributedmutex/proto";
+service TokenRing {
+  rpc RequestToken(Request) returns (Response) {}
+  rpc PassToken(TokenMessage) returns (Response) {}
+}
+
+message Request {
+  int32 node_id = 1;
+}
+
+message TokenMessage {
+  int32 token_holder_id = 1;
+}
+
+message Response {
+  string message = 1;
+}

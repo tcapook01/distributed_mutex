@@ -10,158 +10,121 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tcapook01/distributed_mutex/proto/nodepb" // Asegúrate de que esta ruta sea correcta
+	pb "github.com/tcapook01/distributed_mutex/proto" // replace with actual path
 
 	"google.golang.org/grpc"
 )
 
-type Node struct {
-	nodepb.UnimplementedNodeServer
-	id           int32
-	timestamp    int64
-	requestingCS bool
-	peers        []string
-	grpcClients  map[string]nodepb.NodeClient
-	mutex        sync.Mutex
-	grantChannel chan bool
+type TokenRingServer struct {
+	pb.UnimplementedTokenRingServer
+	nodeID   int32
+	hasToken bool
+	nextNode string
+	mutex    sync.Mutex
 }
 
-func NewNode(id int32, peers []string) *Node {
-	return &Node{
-		id:           id,
-		timestamp:    0,
-		requestingCS: false,
-		peers:        peers,
-		grpcClients:  make(map[string]nodepb.NodeClient),
-		grantChannel: make(chan bool, 1),
+// NewTokenRingServer creates a new server instance
+func NewTokenRingServer(nodeID int32, nextNode string, initialToken bool) *TokenRingServer {
+	return &TokenRingServer{
+		nodeID:   nodeID,
+		hasToken: initialToken,
+		nextNode: nextNode,
 	}
 }
 
-// RequestAccess RPC to handle incoming requests to enter the CS
-func (n *Node) RequestAccess(ctx context.Context, req *nodepb.AccessRequest) (*nodepb.AccessReply, error) {
-	n.mutex.Lock()
-	defer n.mutex.Unlock()
+// PassToken receives the token from the previous node in the ring
+func (s *TokenRingServer) PassToken(ctx context.Context, tokenMsg *pb.TokenMessage) (*pb.Response, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
-	n.timestamp = max(n.timestamp, req.Timestamp) + 1
-	log.Printf("Node %d received access request from Node %d with timestamp %d", n.id, req.NodeId, req.Timestamp)
+	// Print the TokenHolderId and the current node's ID to debug the mismatch
+	fmt.Printf("Node %d received token message: TokenHolderId = %d, NodeID = %d\n", s.nodeID, tokenMsg.TokenHolderId, s.nodeID)
 
-	// Check conditions to grant access or delay
-	if !n.requestingCS || (req.Timestamp < n.timestamp || (req.Timestamp == n.timestamp && req.NodeId < n.id)) {
-		// Convert NodeId to string and use it as key to access grpcClients
-		client, ok := n.grpcClients[strconv.Itoa(int(req.NodeId))]
-		if ok {
-			log.Printf("Node %d is granting access to Node %d", n.id, req.NodeId)
-			client.GrantAccess(ctx, &nodepb.AccessGrant{NodeId: n.id})
+	// Check if the token holder ID matches the previous node's ID
+	if tokenMsg.TokenHolderId == s.nodeID-1 || (s.nodeID == 1 && tokenMsg.TokenHolderId == 3) { // Adjust for first node case
+		s.hasToken = true
+		fmt.Printf("Node %d has received the token and is entering the critical section\n", s.nodeID)
+		s.enterCriticalSection()
+	} else {
+		fmt.Printf("Node %d received token message but it does not match its ID. TokenHolderId = %d\n", s.nodeID, tokenMsg.TokenHolderId)
+	}
+
+	return &pb.Response{Message: "Token passed"}, nil
+}
+
+// enterCriticalSection simulates work in the critical section and then passes the token
+func (s *TokenRingServer) enterCriticalSection() {
+	fmt.Printf("Node %d is entering critical section\n", s.nodeID)
+	time.Sleep(2 * time.Second) // simulate critical section work
+	fmt.Printf("Node %d leaving critical section\n", s.nodeID)
+
+	// After finishing the critical section, pass the token to the next node
+	s.hasToken = false
+	s.passToken() // Pass the token to the next node
+}
+
+// passToken sends the token to the next node in the ring
+func (s *TokenRingServer) passToken() {
+	s.hasToken = false
+	for {
+		conn, err := grpc.Dial(s.nextNode, grpc.WithInsecure())
+		if err != nil {
+			log.Printf("Node %d failed to connect to next node %s: %v", s.nodeID, s.nextNode, err)
+			time.Sleep(1 * time.Second) // Retry after a delay
+			continue
 		}
+		defer conn.Close()
+
+		client := pb.NewTokenRingClient(conn)
+		// Here we pass the current node's ID as TokenHolderId
+		_, err = client.PassToken(context.Background(), &pb.TokenMessage{TokenHolderId: s.nodeID})
+		if err != nil {
+			log.Printf("Node %d failed to pass token: %v", s.nodeID, err)
+			time.Sleep(1 * time.Second) // Retry after a delay
+			continue
+		}
+
+		// Print that the node passed the token to the next node
+		fmt.Printf("Node %d passed the token to node at %s\n", s.nodeID, s.nextNode)
+		break
 	}
-
-	return &nodepb.AccessReply{}, nil
-}
-
-// GrantAccess RPC to receive grants from other nodes
-func (n *Node) GrantAccess(ctx context.Context, grant *nodepb.AccessGrant) (*nodepb.Ack, error) {
-	log.Printf("Node %d received grant from Node %d", n.id, grant.NodeId)
-
-	// Signal that grant was received
-	n.grantChannel <- true
-
-	return &nodepb.Ack{}, nil
-}
-
-// Method to initiate request to enter CS
-func (n *Node) requestCriticalSection() {
-	n.mutex.Lock()
-	n.timestamp++
-	n.requestingCS = true
-	n.mutex.Unlock()
-
-	// Send request to all peers
-	for _, addr := range n.peers {
-		client := n.grpcClients[addr]
-		go func(client nodepb.NodeClient) {
-			client.RequestAccess(context.Background(), &nodepb.AccessRequest{NodeId: n.id, Timestamp: n.timestamp})
-		}(client)
-	}
-
-	// Wait for grants from all peers
-	for range n.peers {
-		<-n.grantChannel
-	}
-
-	// Enter CS
-	n.enterCriticalSection()
-}
-
-// Emulate entering the critical section
-func (n *Node) enterCriticalSection() {
-	log.Printf("Node %d is entering the Critical Section", n.id)
-	time.Sleep(2 * time.Second) // Simulate critical section work
-	log.Printf("Node %d is leaving the Critical Section", n.id)
-
-	n.mutex.Lock()
-	n.requestingCS = false
-	n.mutex.Unlock()
-}
-
-// Helper function to get the max of two timestamps
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatal("Usage: go run node.go <node_id>")
+	if len(os.Args) < 4 {
+		log.Fatalf("Usage: go run node.go <nodeID> <nextNode> <initialToken>")
 	}
 
-	// Convert nodeID from string to int
+	// Parse the nodeID as an int32
 	nodeID, err := strconv.Atoi(os.Args[1])
 	if err != nil {
-		log.Fatalf("Invalid node ID: %v", err)
+		log.Fatalf("Invalid nodeID: %v", err)
 	}
+	nextNode := os.Args[2]
+	initialToken := os.Args[3] == "true"
 
-	// Convert nodeID to int32 for use in Node struct
-	nodeIDInt32 := int32(nodeID)
+	// Create a new server instance
+	server := NewTokenRingServer(int32(nodeID), nextNode, initialToken)
 
-	var peers []string
-	switch nodeID {
-	case 1:
-		peers = []string{"localhost:5002", "localhost:5003"}
-	case 2:
-		peers = []string{"localhost:5001", "localhost:5003"}
-	case 3:
-		peers = []string{"localhost:5001", "localhost:5002"}
-	}
-
-	node := NewNode(nodeIDInt32, peers)
-	listen, err := net.Listen("tcp", fmt.Sprintf(":%d", 5000+nodeID))
-	if err != nil {
-		log.Fatalf("Failed to listen on port %d: %v", 5000+nodeID, err)
-	}
-
-	grpcServer := grpc.NewServer()
-	nodepb.RegisterNodeServer(grpcServer, node)
-	log.Printf("Node %d listening on port %d", nodeID, 5000+nodeID)
-
-	// Establish client connections to peers
-	for _, addr := range peers {
-		conn, err := grpc.Dial(addr, grpc.WithInsecure())
-		if err != nil {
-			log.Fatalf("Failed to connect to peer at %s: %v", addr, err)
-		}
-		defer conn.Close()
-		node.grpcClients[addr] = nodepb.NewNodeClient(conn)
+	// If the node is the initial holder, start the process by passing the token
+	if initialToken {
+		go func() {
+			time.Sleep(1 * time.Second) // Wait a moment before starting the token pass
+			server.passToken()
+		}()
 	}
 
 	// Start the gRPC server
-	go grpcServer.Serve(listen)
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", 5000+nodeID))
+	if err != nil {
+		log.Fatalf("Failed to listen on port: %v", err)
+	}
 
-	// Make nodes request access to the critical section periodically
-	for {
-		// Simulate random delay before making each request (example: 5-10 seconds)
-		time.Sleep(time.Duration(5+node.id) * time.Second) // Random delay between requests
-		node.requestCriticalSection()                      // Request access to CS
+	grpcServer := grpc.NewServer()
+	pb.RegisterTokenRingServer(grpcServer, server)
+
+	fmt.Printf("Node %d is starting\n", server.nodeID)
+	if err := grpcServer.Serve(listener); err != nil {
+		log.Fatalf("Failed to serve: %v", err)
 	}
 }
