@@ -7,8 +7,10 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tcapook01/distributed_mutex/proto/nodepb" // Asegúrate de que esta ruta sea correcta
@@ -16,18 +18,21 @@ import (
 	"google.golang.org/grpc"
 )
 
+// Represents a single node in the distributed system
 type Node struct {
 	nodepb.UnimplementedNodeServer
 	id              int32
 	timestamp       int64
 	requestingCS    bool
-	peers           map[int32]string
+	peers           map[int32]string // peerId -> address
 	grpcClients     map[int32]nodepb.NodeClient
+	connections     map[int32]*grpc.ClientConn // peerID -> connection
 	mutex           sync.Mutex
 	grantChannel    chan bool
 	deferredRequest []nodepb.AccessRequest
 }
 
+// Initializes a new Node instance
 func NewNode(id int32, peers map[int32]string) *Node {
 	return &Node{
 		id:              id,
@@ -35,6 +40,7 @@ func NewNode(id int32, peers map[int32]string) *Node {
 		requestingCS:    false,
 		peers:           peers,
 		grpcClients:     make(map[int32]nodepb.NodeClient),
+		connections:     make(map[int32]*grpc.ClientConn),
 		grantChannel:    make(chan bool, len(peers)),
 		deferredRequest: []nodepb.AccessRequest{},
 	}
@@ -66,7 +72,7 @@ func (n *Node) RequestAccess(ctx context.Context, req *nodepb.AccessRequest) (*n
 	}
 
 	if shouldGrant {
-		// Grant access by sending GrantAccess
+		// Grant access by sending GrantAccess RPC
 		client, exists := n.grpcClients[req.NodeId]
 		if exists {
 			go func(client nodepb.NodeClient) {
@@ -93,7 +99,7 @@ func (n *Node) RequestAccess(ctx context.Context, req *nodepb.AccessRequest) (*n
 	return &nodepb.AccessReply{}, nil
 }
 
-// Handles incoming access replies
+// Handles incoming grant messages from other nodes
 func (n *Node) GrantAccess(ctx context.Context, grant *nodepb.AccessGrant) (*nodepb.Ack, error) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
@@ -117,26 +123,9 @@ func (n *Node) requestCriticalSection() {
 	log.Printf("Node %d is requesting access to the critical section with timestamp %d", n.id, currentTimestamp)
 
 	// Send request to all peers
-	for peerID, client := range n.grpcClients {
-		go func(peerID int32, client nodepb.NodeClient) {
-			_, err := client.RequestAccess(context.Background(), &nodepb.AccessRequest{
-				NodeId:    n.id,
-				Timestamp: currentTimestamp,
-			})
-			if err != nil {
-				log.Printf("Failed to send RequestAccess to Node %d: %v", peerID, err)
-			} else {
-				log.Printf("Node %d sent RequestAccess to Node %d", n.id, peerID)
-			}
-		}(peerID, client)
+	for peerID := range n.peers {
+		go n.sendRequestAccess(peerID, currentTimestamp)
 	}
-
-	/*for _, addr := range n.peers {
-		client := n.grpcClients[addr]
-		go func(client nodepb.NodeClient) {
-			client.RequestAccess(context.Background(), &nodepb.AccessRequest{NodeId: n.id, Timestamp: n.timestamp})
-		}(client)
-	}*/
 
 	// Wait for grants from all peers
 	grantReceived := 0
@@ -149,6 +138,40 @@ func (n *Node) requestCriticalSection() {
 	n.enterCriticalSection()
 }
 
+// sends a RequestAccess RPC to a specific peer
+func (n *Node) sendRequestAccess(peerID int32, timestamp int64) {
+	n.mutex.Lock()
+	client, exists := n.grpcClients[peerID]
+	n.mutex.Unlock()
+
+	if !exists {
+		log.Printf("No client found for Node %d. Skipping RequestAccess.", peerID)
+		return
+	}
+
+	req := &nodepb.AccessRequest{
+		NodeId:    n.id,
+		Timestamp: timestamp,
+	}
+
+	maxRetries := 5
+	backoff := time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		_, err := client.RequestAccess(context.Background(), req)
+		if err != nil {
+			log.Printf("Attempt %d: Failed to send RequestAccess to Node %d: %v", attempt, peerID, err)
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+		log.Printf("Node %d successfully sent RequestAccess to Node %d", n.id, peerID)
+		return
+	}
+
+	log.Printf("Failed to send RequestAccess to Node %d after %d attempts", peerID, maxRetries)
+}
+
 // Emulate entering the critical section
 func (n *Node) enterCriticalSection() {
 	log.Printf("Node %d is entering the Critical Section", n.id)
@@ -159,6 +182,7 @@ func (n *Node) enterCriticalSection() {
 
 	n.mutex.Lock()
 	n.requestingCS = false
+
 	// Process deferred request
 	for _, req := range n.deferredRequest {
 		client, exists := n.grpcClients[req.NodeId]
@@ -181,13 +205,53 @@ func (n *Node) enterCriticalSection() {
 	n.mutex.Unlock()
 }
 
-// Helper function to get the max of two timestamps
+func (n *Node) connectToPeers() {
+	for peerID, addr := range n.peers {
+		go func(peerID int32, addr string) {
+			var conn *grpc.ClientConn
+			var err error
+			for {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				conn, err = grpc.DialContext(ctx, addr, grpc.WithInsecure(), grpc.WithBlock())
+				if err != nil {
+					log.Printf("Failed to connect to peer %d at %s: %v. Retrying...", peerID, addr, err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				log.Printf("Successfully connected to peer %d at %s", peerID, addr)
+				n.mutex.Lock()
+				n.grpcClients[peerID] = nodepb.NewNodeClient(conn)
+				n.mutex.Unlock()
+				break
+			}
+		}(peerID, addr)
+	}
+}
+
+// Closes all gRPC client connection in a graceful way
+func (n *Node) closeConnections() {
+	n.mutex.Lock()
+	defer n.mutex.Unlock()
+	for peerID, conn := range n.connections {
+		if conn != nil {
+			err := conn.Close()
+			if err != nil {
+				log.Printf("Error closing connection to Node %d: %v", peerID, err)
+			} else {
+				log.Printf("Closed connection to Node %d", peerID)
+			}
+		}
+	}
+}
+
+/*// Helper function to get the max of two timestamps
 func max(a, b int64) int64 {
 	if a > b {
 		return a
 	}
 	return b
-}
+}*/
 
 func main() {
 	if len(os.Args) < 2 {
@@ -217,6 +281,8 @@ func main() {
 		peers = map[int32]string{
 			1: "localhost:5001",
 			2: "localhost:5002"}
+	default:
+		log.Fatalf("Unsupported node ID: %d", nodeID)
 	}
 
 	node := NewNode(nodeIDInt32, peers)
@@ -230,17 +296,26 @@ func main() {
 	log.Printf("Node %d listening on port %d", nodeID, 5000+nodeID)
 
 	// Establish client connections to peers
-	for peerID, addr := range peers {
-		conn, err := grpc.Dial(addr, grpc.WithInsecure())
-		if err != nil {
-			log.Fatalf("Failed to connect to peer at %s: %v", addr, err)
-		}
-		// defer conn.Close()
-		node.grpcClients[peerID] = nodepb.NewNodeClient(conn)
-	}
+	node.connectToPeers()
 
-	// Start the gRPC server
-	go grpcServer.Serve(listen)
+	// Handle graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal %s, shutting down gracefully...", sig)
+		grpcServer.GracefulStop()
+		node.closeConnections()
+		os.Exit(0)
+	}()
+
+	// Start the gRPC server in a seperate goroutin
+	go func() {
+		if err := grpcServer.Serve(listen); err != nil {
+			log.Fatalf("Failed to serve gRPC server: %v", err)
+		}
+	}()
 
 	// Seed the random nubmer generator
 	rand.Seed(time.Now().UnixNano())
@@ -250,7 +325,6 @@ func main() {
 		// Simulate random delay before making each request (example: 5-10 seconds)
 		sleepDuration := time.Duration(rand.Intn(6)+5) * time.Second
 		time.Sleep(sleepDuration)
-		//time.Sleep(time.Duration(5+node.id) * time.Second) // Random delay between requests
 		node.requestCriticalSection() // Request access to CS
 	}
 }
